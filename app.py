@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import time
+import tempfile
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from starlette.staticfiles import StaticFiles
 import accounts
 import preprocess
 from explain import explain
-from video import analyze_video
+from video_model import VideoPredictor # NEW IMPORT
 
 BASE = Path(__file__).parent
 
@@ -40,11 +41,19 @@ accounts.init()
 LOW = float(os.getenv("LOW_THRESHOLD", "0.30"))
 HIGH = float(os.getenv("HIGH_THRESHOLD", "0.70"))
 predictor = None
+video_predictor = None # NEW GLOBAL
 model_lock = threading.Lock()
 hits = defaultdict(deque)
 
 
-def tier(score):
+def tier(score, custom_threshold=None):
+    if custom_threshold is not None:
+        if score < custom_threshold - 0.1:
+            return "low"
+        elif score > custom_threshold + 0.1:
+            return "high"
+        return "uncertain"
+        
     if score < LOW:
         return "low"
     return "high" if score > HIGH else "uncertain"
@@ -52,10 +61,8 @@ def tier(score):
 
 def rate_limit(request, name, per_minute):
     if os.getenv("SPACE_ID"):
-        # Hosted on Hugging Face: requests arrive through its proxy.
         ip = request.headers.get("x-forwarded-for", "").split(",")[-1].strip() or "proxy"
     else:
-        # Listening on this computer only; a Cloudflare tunnel sets cf-connecting-ip.
         ip = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "?")
     q, now = hits[(name, ip)], time.time()
     while q and now - q[0] > 60:
@@ -66,7 +73,6 @@ def rate_limit(request, name, per_minute):
 
 
 def global_limit(name, per_minute):
-    """A cap shared by all visitors, to protect the Groq quota."""
     q, now = hits[(name, "everyone")], time.time()
     while q and now - q[0] > 60:
         q.popleft()
@@ -83,8 +89,6 @@ def require_user(request):
 
 
 def require_same_site(request):
-    """Other websites cannot add this header without permission (no CORS is enabled), which blocks
-    forged requests. The session cookie is also SameSite=Strict."""
     if request.headers.get("x-deepguard") != "1":
         raise HTTPException(403, "Request blocked.")
 
@@ -95,7 +99,6 @@ def guard(request):
 
 
 async def read_files(request, fields=("file",), limit=MAX_BYTES):
-    """Call only after the user has been checked, so strangers' uploads are never read."""
     too_big = f"File is too large (limit {limit // 1024 // 1024} MB)."
     try:
         length = int(request.headers["content-length"])
@@ -142,7 +145,7 @@ def run_model(bgr):
 
 def record(user, kind, filename, result):
     if result["status"] == "ok":
-        accounts.add_history(user["id"], kind, filename, result["tier"], result["score"], predictor.version)
+        accounts.add_history(user["id"], kind, filename, result["tier"], result["score"], result["model"])
 
 
 async def analyze(request):
@@ -182,23 +185,41 @@ async def compare(request):
                          "difference": round(abs(results[0]["score"] - results[1]["score"]), 4) if both else None})
 
 
-def score_face(crop):
-    with model_lock:
-        return predictor.predict(crop)[0]
-
-
 async def video(request):
     user = guard(request)
     rate_limit(request, "video", 4)
     [(name, data)] = await read_files(request, limit=MAX_VIDEO_BYTES)
+    
+    # Save uploaded video to a temporary file
+    def process_video(data):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        try:
+            return video_predictor.predict_video(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+            
     try:
-        result = await run_in_threadpool(analyze_video, data, score_face)
-    except ValueError as e:
-        raise HTTPException(422, str(e))
-    if result["status"] == "ok":
-        result["tier"] = tier(result["score"])
-        result["model"] = predictor.version
-        record(user, "video (experimental)", name, result)
+        result = await run_in_threadpool(process_video, data)
+    except Exception as e:
+        raise HTTPException(500, f"Video processing error: {str(e)}")
+
+    if result.get("status") != "ok":
+        raise HTTPException(422, result.get("error", "Could not process video."))
+        
+    score = result["score"]
+    threshold = result.get("threshold", 0.5)
+    
+    result["tier"] = tier(score, custom_threshold=threshold)
+    result["model"] = result.get("version", "Video Model")
+    result["face_frames"] = 16
+    result["sampled"] = 16
+    
+    # Mock the frames array for the UI chart
+    result["frames"] = [{"time": i, "score": score} for i in range(16)]
+    
+    record(user, "video", name, result)
     return JSONResponse(result)
 
 
@@ -312,16 +333,26 @@ app = Starlette(routes=[
 
 
 def main():
-    global predictor
+    global predictor, video_predictor
     import uvicorn
     from model import Predictor
     if not preprocess.cascade_ok():
         raise SystemExit("OpenCV face detector file is missing. Install the versions in requirements.txt.")
-    path = Path(os.getenv("MODEL_PATH", BASE / "checkpoints" / "deepguard_image_best.pth"))
-    if not path.exists():
-        raise SystemExit(f"Model file not found: {path}")
-    predictor = Predictor(path)
+        
+    # Load Image Model
+    img_path = Path(os.getenv("MODEL_PATH", BASE / "checkpoints" / "deepguard_image_best.pth"))
+    if not img_path.exists():
+        raise SystemExit(f"Image model file not found: {img_path}")
+    predictor = Predictor(img_path)
     print(f"Loaded {predictor.version} on {predictor.device} (checkpoint val AUC: {predictor.val_auc})")
+
+    # Load Video Model
+    vid_path = Path(BASE / "checkpoints" / "deepguard_video_deployment.pth")
+    if not vid_path.exists():
+        raise SystemExit(f"Video model file not found: {vid_path}")
+    video_predictor = VideoPredictor(vid_path)
+    print(f"Loaded {video_predictor.version} on {video_predictor.device} (Test AUC: {video_predictor.test_auc:.4f})")
+
     uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "8000")))
 
 
