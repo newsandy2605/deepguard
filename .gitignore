@@ -1,0 +1,17 @@
+# Environments
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+.env.example
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Kaggle / Outputs
+kaggle/
+*.npy
+*.zip
